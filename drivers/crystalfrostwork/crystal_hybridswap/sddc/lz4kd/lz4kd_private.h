@@ -155,6 +155,21 @@ inline static void copy_x_while_total(
 		m_copy(dst += copy_min, src += copy_min, copy_min);
 }
 
+inline static size_t copy_64_while_le(
+	uint8_t *dst,
+	const uint8_t *src,
+	const uint8_t *const dst_end)
+{
+	const uint8_t *const dst_start = dst;
+
+	while ((size_t)(dst_end - dst) >= 64) {
+		m_copy(dst, src, 64);
+		dst += 64;
+		src += 64;
+	}
+	return dst - dst_start;
+}
+
 inline static void copy_2x(
 	uint8_t *dst,
 	const uint8_t *src,

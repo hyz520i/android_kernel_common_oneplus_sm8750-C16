@@ -29,6 +29,19 @@ inline static uint_fast32_t hash(const uint8_t *r, uint32_t shift)
 	return hashv(read8_at(r), shift);
 }
 
+/* Offset zero terminates a hash chain, so real window positions are one-based. */
+inline static uint16_t window_offset(const uint8_t *const base,
+		const uint8_t *const p)
+{
+	return (uint16_t)((p - base) + 1);
+}
+
+inline static const uint8_t *window_pointer(const uint8_t *const base,
+		uint16_t offset)
+{
+	return base + offset - 1;
+}
+
 static void fill_ht_offsets_s(
 	const uint_fast32_t off0,
 	uint16_t *const ht,
@@ -52,49 +65,60 @@ static void fill_ht_offsets_s(
 	ht[h3] = (uint16_t)(off0 + off3);
 }
 
-static void update_hash_table(
+static bool update_hash_table(
 	uint16_t *const ht,
-	const uint8_t *const in1,
-	const uint8_t *const in_end)
+	const uint8_t *const base,
+	const uint8_t *const ref_end,
+	const uint8_t *const window_end)
 {
 	static const uint64_t read_bytes = 8;
 	uint64_t a = 0;
-	const uint8_t *const in0 = in1 - 1;
-	const uint8_t *r = in1;
+	const uint8_t *r = base;
 	uint16_t *const past_offset = ht + (1 << HT_LOG2);
+
+	if (unlikely(ref_end < base || window_end < ref_end ||
+		     (size_t)(window_end - ref_end) < read_bytes - 1))
+		return false;
+
 	m_set(ht, 0, ht_bytes_max());
 	past_offset[0] = 0; /* stopper in encode_any2() */
-	while (likely(r + read_bytes <= in_end)) {
+	while (likely((size_t)(ref_end - r) >= read_bytes)) {
 		a = read8_at(r);
-		fill_ht_offsets_s((uint16_t)(r - in0), ht, past_offset, a);
+		fill_ht_offsets_s(window_offset(base, r), ht, past_offset, a);
 		r += REPEAT_MIN;
 	}
-	for (; likely(r < in_end); ++r) { /* here in_end=start of the ref block */
-		uint_fast32_t off0 = (uint16_t)(r - in0);
+	for (; likely(r < ref_end); ++r) {
+		uint_fast32_t off0 = window_offset(base, r);
 		uint_fast32_t h = hash(r, HT_LOG2);
 		past_offset[off0] = ht[h];
 		ht[h] = (uint16_t)(off0);
 	}
+
+	return true;
 }
 
 static void hash_repeat_tail(
 	uint16_t *const ht,
 	uint16_t *const past_offset,
-	const uint8_t *const in0,
+	const uint8_t *const base,
 	const uint8_t *const r)
 {
 	const uint8_t *s = r - 1 - 1 - 1;
 	uint_fast32_t h = hash(s, HT_LOG2);
-	past_offset[s - in0] = ht[h];
-	ht[h] = (uint16_t)(s - in0);
+	uint16_t offset = window_offset(base, s);
+
+	past_offset[offset] = ht[h];
+	ht[h] = offset;
 	++s;
 	h = hash(s, HT_LOG2);
-	past_offset[s - in0] = ht[h];
-	ht[h] = (uint16_t)(s - in0);
+	offset = window_offset(base, s);
+	past_offset[offset] = ht[h];
+	ht[h] = offset;
 	++s;
 	h = hash(s, HT_LOG2);
-	past_offset[s - in0] = ht[h];
-	ht[h] = (uint16_t)(s - in0);
+	offset = window_offset(base, s);
+	past_offset[offset] = ht[h];
+	ht[h] = offset;
 }
 
 enum {
@@ -116,12 +140,14 @@ static int encode_any2(
 {
 	uint8_t *out_at = out + 1; /* +1 for header */
 	const uint8_t *const in_end_safe = in_end - NR_COPY_MIN;
-	const uint8_t *const in0 = in1 - 1;
+	const uint8_t *const base = in1;
 	const uint8_t *r = in;
 	const uint8_t *nr0 = in;
 	uint_fast32_t r_bytes_max = 0;
 	uint16_t *const past_offset = ht + (1 << HT_LOG2);
-	update_hash_table(ht, in1, in1 + (in - in1));
+
+	if (unlikely(!update_hash_table(ht, base, in, in_end)))
+		return LZ4K_STATUS_FAILED;
 	while (true) {
 		uint_fast32_t off0 = 0;
 		uint_fast32_t utag = 0;
@@ -132,25 +158,34 @@ static int encode_any2(
 		while (true) {
 			uint64_t sv = read8_at(s);
 			uint_fast32_t h = hashv(sv, HT_LOG2);
-			off0 = past_offset[s - in0] = ht[h];
-			ht[h] = (uint16_t)(s - in0);
-			for (; off0 && !equal4pv((q = in0 + off0), sv); off0 = past_offset[off0]);
+			uint16_t s_offset = window_offset(base, s);
+			uint_fast32_t advance;
+
+			off0 = past_offset[s_offset] = ht[h];
+			ht[h] = s_offset;
+			for (; off0 &&
+			     !equal4pv((q = window_pointer(base, off0)), sv);
+			     off0 = past_offset[off0])
+				;
 			if (off0 != 0)
 				break; /* repeat found */
-			if (unlikely((s += (++step >> STEP_LOG2)) > in_end_safe))
+			advance = ++step >> STEP_LOG2;
+			if (unlikely(advance > (size_t)(in_end_safe - s)))
 				return crystal_lz4kd_out_tail(out_at, out_end, out, nr0,
-					 in_end, nr_log2, OFF_LOG2);
+						 in_end, nr_log2, OFF_LOG2);
+			s += advance;
 		} /* for */
 		utag = (uint_fast32_t)(s - q);
 		r_end = crystal_lz4kd_repeat_end(q, s, in_end_safe, in_end, simd);
 		r_bytes_max = (uint_fast32_t)(r_end - (r = repeat_start(q, s, nr0, in1)));
-		if (s + r_bytes_max >= in_end) /* see the bottom of while() below */
+		if (r_bytes_max >= (size_t)(in_end - s))
 			goto REPEAT_DONE; /* match_max(q, s, r_bytes_max + 1) below */
 		step = Q_MAX - 1;
 		while ((off0 = past_offset[off0]) && (q >= in || step > 0)) {
 			const uint8_t *r_start = NULL;
 			--step;
-			if (!match_max((q = in0 + off0), s, r_bytes_max + 1))
+			if (!match_max((q = window_pointer(base, off0)), s,
+				       r_bytes_max + 1))
 				continue;
 			r_end = crystal_lz4kd_repeat_end(q, s, in_end_safe,
 						   in_end, simd);
@@ -160,7 +195,7 @@ static int encode_any2(
 			r_bytes_max = (uint_fast32_t)(r_end - r_start);
 			r = r_start;
 			utag = (uint_fast32_t)(s - q);
-			if (s + r_bytes_max >= in_end ||
+			if (r_bytes_max >= (size_t)(in_end - s) ||
 			    (q < in && r_bytes_max >= MATCH_MAX))
 				goto REPEAT_DONE;
 		}
@@ -169,12 +204,15 @@ REPEAT_DONE:
 				r_bytes_max, nr_log2, OFF_LOG2, check_out);
 		if (unlikely(check_out && out_at == NULL))
 			return LZ4K_STATUS_WRITE_ERROR;
-		if (unlikely((r += r_bytes_max) > in_end_safe))
+		if (unlikely(r_bytes_max > (size_t)(in_end - r)))
+			return LZ4K_STATUS_FAILED;
+		r += r_bytes_max;
+		if (unlikely(r > in_end_safe))
 			return r == in_end ? (int)(out_at - out) :
 				crystal_lz4kd_out_tail(out_at, out_end, out, r,
 					in_end,
 					nr_log2, OFF_LOG2);
-		hash_repeat_tail(ht, past_offset, in0, r);
+		hash_repeat_tail(ht, past_offset, base, r);
 		nr0 = r;
 	} /* for */
 }

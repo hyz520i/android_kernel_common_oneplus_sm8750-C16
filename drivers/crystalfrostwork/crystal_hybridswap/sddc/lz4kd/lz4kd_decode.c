@@ -43,6 +43,7 @@ static int end_of_block(
 enum {
 	NR_COPY_MIN = 16,
 	R_COPY_MIN = 16,
+	R_COPY_WIDE = 64,
 	R_COPY_SAFE_2X = (R_COPY_MIN << 1) - 1
 };
 
@@ -86,28 +87,41 @@ static bool out_non_repeat(
 	return true;
 }
 
-static void out_repeat_overlap(
+static void out_repeat_forward(
+	uint8_t *out_at,
+	const uint8_t *out_from,
+	const uint8_t *const out_copy_end)
+{
+	while (out_at < out_copy_end)
+		*out_at++ = *out_from++;
+}
+
+static void out_repeat_small_offset(
 	uint_fast32_t offset,
 	uint8_t *out_at,
 	const uint8_t *out_from,
 	const uint8_t *const out_copy_end)
 {
-	enum {
-		COPY_MIN = R_COPY_MIN >> 1,
-		OFFSET_LIMIT = COPY_MIN >> 1
-	};
-	m_copy(out_at, out_from, COPY_MIN);
-/* (1 < offset < R_COPY_MIN/2) && out_copy_end + R_COPY_SAFE_2X  <= out_end */
-	out_at += offset;
-	if (offset <= OFFSET_LIMIT)
-		offset <<= 1;
-	do {
-		m_copy(out_at, out_from, COPY_MIN);
-		out_at += offset;
-		if (offset <= OFFSET_LIMIT)
-			offset <<= 1;
-	} while (out_at - out_from < R_COPY_MIN);
-	while_lt_copy_2x_as_x2(out_at, out_from, out_copy_end, R_COPY_MIN);
+	const uint8_t *const match_from = out_from;
+	const uint_fast32_t fast_distance =
+		((R_COPY_MIN + offset - 1) / offset) * offset;
+	size_t bootstrap_len = fast_distance - offset;
+	size_t copy_len = out_copy_end - out_at;
+
+	/*
+	 * Small-offset LZ repeat expansion intentionally reads bytes that were
+	 * just written by the same match.  Do not use fixed-width memcpy() until
+	 * the destination is at least R_COPY_MIN bytes away from match_from and
+	 * phase-aligned with the original offset; memcpy() overlap semantics are
+	 * undefined and memmove() is not the required LZ forward-copy semantic.
+	 */
+	if (bootstrap_len > copy_len)
+		bootstrap_len = copy_len;
+	out_repeat_forward(out_at, out_from, out_at + bootstrap_len);
+	out_at += bootstrap_len;
+	if (out_at < out_copy_end)
+		while_lt_copy_2x_as_x2(out_at, match_from, out_copy_end,
+				       R_COPY_MIN);
 }
 
 static void out_repeat_slow(
@@ -115,19 +129,12 @@ static void out_repeat_slow(
 	uint_fast32_t offset,
 	uint8_t *out_at,
 	const uint8_t *out_from,
-	const uint8_t *const out_copy_end,
-	const uint8_t *const out_safe_end)
+	const uint8_t *const out_copy_end)
 {
-	if (offset > 1 && out_copy_end <= out_safe_end) {
-		out_repeat_overlap(offset, out_at, out_from, out_copy_end);
+	if (offset == 1) {
+		m_set(out_at, *out_from, r_bytes_max);
 	} else {
-		if (offset == 1) {
-			m_set(out_at, *out_from, r_bytes_max);
-		} else {
-			do
-				*out_at++ = *out_from++;
-			while (out_at < out_copy_end);
-		}
+		out_repeat_forward(out_at, out_from, out_copy_end);
 	}
 }
 
@@ -175,19 +182,30 @@ static int decode(
 			return LZ4K_STATUS_FAILED;
 		out_from = out_at - offset;
 		out_copy_end = out_at + r_bytes_max;
+		if (unlikely(r_bytes_max >= R_COPY_WIDE &&
+			     offset >= R_COPY_WIDE &&
+			     out_copy_end <= out_end)) {
+			const size_t copied = copy_64_while_le(out_at, out_from,
+							       out_copy_end);
+
+			out_at += copied;
+			out_from += copied;
+			if (out_at == out_copy_end)
+				goto repeat_done;
+		}
 		if (likely(offset >= R_COPY_MIN &&
-			   out_copy_end <= out_safe_end)) {
+				   out_copy_end <= out_safe_end)) {
 			copy_2x_as_x2_while_lt(out_at, out_from, out_copy_end,
 					       R_COPY_MIN);
-		} else if (likely(offset >= (R_COPY_MIN >> 1) &&
+		} else if (likely(offset > 1 && offset < R_COPY_MIN &&
 				  out_copy_end <= out_safe_end)) {
-			m_copy(out_at, out_from, R_COPY_MIN);
-			out_at += offset;
-			while_lt_copy_x(out_at, out_from, out_copy_end, R_COPY_MIN);
+			out_repeat_small_offset(offset, out_at, out_from,
+						out_copy_end);
 		} else {
 			out_repeat_slow(r_bytes_max, offset, out_at, out_from,
-				out_copy_end, out_safe_end);
+					out_copy_end);
 		}
+repeat_done:
 		out_at = out_copy_end;
 	}
 	return in_at == in_end ? (int)(out_at - out) : LZ4K_STATUS_FAILED;
@@ -253,7 +271,7 @@ int crystal_lz4kd_decode_delta(
 		     out_addr - out0_addr > (1U << BLOCK_4KB_LOG2)))
 		return LZ4K_STATUS_FAILED;
 	if (unlikely(!crystal_lz4kd_valid_range(in, in_max, out, out_max,
-			2 + TAG_BYTES_MAX, 2U << BLOCK_4KB_LOG2,
+			1 + TAG_BYTES_MAX, 2U << BLOCK_4KB_LOG2,
 			1U << BLOCK_4KB_LOG2)))
 		return LZ4K_STATUS_FAILED;
 
