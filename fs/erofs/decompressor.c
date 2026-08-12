@@ -25,6 +25,28 @@ struct z_erofs_lz4_decompress_ctx {
 	unsigned int oend;
 };
 
+static struct page *z_erofs_lz4_alloc_bouncepage(struct page **pagepool,
+						 gfp_t gfp)
+{
+	struct page *page;
+
+	/*
+	 * Readahead can request best-effort temporary buffers with
+	 * GFP_NOWAIT | __GFP_NORETRY.  However, once the LZ4 general path
+	 * needs a bounce page for a sparse output list, that page is no
+	 * longer optional for this decompression shot: returning -ENOMEM
+	 * here marks file-backed output pages with an I/O error and can be
+	 * observed by mmap faults as a userspace SIGBUS.  Keep the fast
+	 * best-effort attempt first, but avoid noisy allocation splats and
+	 * fall back to the historical blocking allocation if it misses.
+	 */
+	page = __erofs_allocpage(pagepool, gfp | __GFP_NOWARN, true);
+	if (page || (gfp & __GFP_NOFAIL))
+		return page;
+
+	return __erofs_allocpage(pagepool, GFP_NOFS | __GFP_NOFAIL, true);
+}
+
 static int z_erofs_load_lz4_config(struct super_block *sb,
 			    struct erofs_super_block *dsb, void *data, int size)
 {
@@ -113,7 +135,8 @@ static int z_erofs_lz4_prepare_dstpages(struct z_erofs_lz4_decompress_ctx *ctx,
 			victim = availables[--top];
 			get_page(victim);
 		} else {
-			victim = __erofs_allocpage(pagepool, rq->gfp, true);
+			victim = z_erofs_lz4_alloc_bouncepage(pagepool,
+							      rq->gfp);
 			if (!victim)
 				return -ENOMEM;
 			set_page_private(victim, Z_EROFS_SHORTLIVED_PAGE);
